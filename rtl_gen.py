@@ -6,6 +6,10 @@ import tempfile
 import re
 import time
 import shutil
+import json
+import glob
+import html as html_lib
+from datetime import datetime, timezone
 
 def find_executable(name):
     """Find an executable, checking PATH first, then common Windows install locations."""
@@ -35,12 +39,22 @@ st.markdown("""
 }
 .header h1 { color: #C9A84C; margin: 0; font-size: 26px; }
 .header p  { color: #90CAF9; margin: 4px 0 0 0; font-size: 13px; }
+.bug-box {
+    background: #2B1A1A; border-left: 4px solid #E57373; padding: 12px 16px;
+    border-radius: 4px; margin: 8px 0;
+}
+.bug-box b { color: #E57373; }
 </style>
 <div class="header">
     <h1>⚡ RTL Gen &nbsp; <span style="font-size:14px;color:#90CAF9;font-weight:400">AI Verilog Generator + Auto-Verification</span></h1>
-    <p>Describe a chip in English → get compiled, simulated Verilog RTL &nbsp;·&nbsp; Sahastra Mudra Semiconductors</p>
+    <p>Describe a chip in English → get compiled, simulated Verilog RTL, a waveform, and a plain-English bug story &nbsp;·&nbsp; Sahastra Mudra Semiconductors</p>
 </div>
 """, unsafe_allow_html=True)
+
+if "gallery" not in st.session_state:
+    st.session_state["gallery"] = []
+if "prompt_text" not in st.session_state:
+    st.session_state["prompt_text"] = ""
 
 # ── SIDEBAR ─────────────────────────────────────────────────────
 with st.sidebar:
@@ -57,6 +71,12 @@ with st.sidebar:
     else:
         st.error("❌ Icarus Verilog NOT found")
         st.caption("Install from bleyer.org/icarus and restart VS Code")
+
+    try:
+        import vcdvcd  # noqa: F401
+        st.success("✅ Waveform engine ready")
+    except ImportError:
+        st.error("❌ 'vcdvcd' package missing — add it to requirements.txt")
 
     st.divider()
     st.markdown("### 📚 Example prompts")
@@ -75,21 +95,8 @@ with st.sidebar:
     max_retries = st.slider("Max auto-fix attempts", 1, 5, 3,
                              help="How many times to retry if the generated code fails to compile")
 
-# ── MAIN INPUT ──────────────────────────────────────────────────
-if "prompt_text" not in st.session_state:
-    st.session_state["prompt_text"] = ""
-
-description = st.text_area(
-    "Describe the chip / module you want in plain English",
-    value=st.session_state["prompt_text"],
-    height=100,
-    placeholder="e.g. A 4-bit binary counter with synchronous reset and enable input"
-)
-
-module_name = st.text_input("Module name (must match Verilog module name)", value="my_module")
-
-col_gen, col_clear = st.columns([1, 5])
-generate_clicked = col_gen.button("⚡ Generate & Verify", type="primary", use_container_width=True)
+    st.divider()
+    st.caption(f"🖼️ {len(st.session_state['gallery'])} verified design(s) in this session's gallery")
 
 # ── HELPER FUNCTIONS ────────────────────────────────────────────
 def extract_verilog_code(text):
@@ -130,6 +137,9 @@ REQUIREMENTS:
 - Include clear port declarations with appropriate widths
 - Add brief comments explaining each major block
 - Also generate a simple self-checking testbench module named {module_name}_tb that instantiates the design, applies a few test stimuli, and uses $display to print PASS or FAIL for each check, then $finish at the end
+- Inside the testbench's initial block, BEFORE any stimulus is applied, add exactly these two lines so the waveform can be captured:
+  $dumpfile("dump.vcd");
+  $dumpvars(0, {module_name}_tb);
 - Both modules must be in the same code block, module first then testbench
 - Do not include any explanation text outside the code block — output ONLY the Verilog code inside a single ```verilog code fence
 """
@@ -162,11 +172,36 @@ ISSUE FOUND:
 
 {guidance}
 
+Keep the $dumpfile("dump.vcd"); and $dumpvars(0, {module_name}_tb); lines at the start of the testbench's initial block in the corrected version.
+
 Output ONLY the corrected Verilog code (module + testbench) inside a single ```verilog code fence. No explanation text outside the code block.
 """
 
+def build_explain_prompt(error_message, description, module_name):
+    is_functional_failure = "FUNCTIONAL VERIFICATION FAILURE" in error_message
+    kind = "a functional logic bug (code compiled and ran, but a self-check assertion failed)" if is_functional_failure else "a compile-time error"
+    return f"""A Verilog design for "{description}" (module {module_name}) hit {kind}.
+
+DETAILS:
+{error_message}
+
+In 2-4 short sentences of plain English (no jargon dump, no code), explain to a hardware engineer:
+1. What went wrong, in plain terms.
+2. Why it happened (the root cause).
+Do not restate the raw error text. Do not include a code fence. Just the explanation, as prose.
+"""
+
+def explain_bug(error_message, description, module_name, api_key):
+    """Ask Gemini for a plain-English root-cause explanation of a bug. Never raises — falls back gracefully."""
+    try:
+        prompt = build_explain_prompt(error_message, description, module_name)
+        text = call_gemini(prompt, api_key, max_api_retries=2)
+        return text.strip()
+    except Exception:
+        return None
+
 def compile_and_simulate(verilog_code, module_name, work_dir):
-    """Try to compile with iverilog and run with vvp. Returns (success, output_or_error, functional_pass)."""
+    """Try to compile with iverilog and run with vvp. Returns (success, output_or_error, functional_pass, vcd_path_or_None)."""
     v_file = os.path.join(work_dir, f"{module_name}.v")
     vvp_file = os.path.join(work_dir, f"{module_name}.vvp")
 
@@ -179,20 +214,26 @@ def compile_and_simulate(verilog_code, module_name, work_dir):
     )
 
     if compile_result.returncode != 0:
-        return False, "COMPILATION ERROR:\n" + compile_result.stderr, False
+        return False, "COMPILATION ERROR:\n" + compile_result.stderr, False, None
 
     sim_result = subprocess.run(
         [VVP_PATH, vvp_file],
-        capture_output=True, text=True, timeout=30
+        capture_output=True, text=True, timeout=30, cwd=work_dir
     )
 
+    vcd_candidate = os.path.join(work_dir, "dump.vcd")
+    vcd_path = vcd_candidate if os.path.exists(vcd_candidate) else None
+    # Fallback: some generations might name the dumpfile differently despite instructions
+    if vcd_path is None:
+        found = glob.glob(os.path.join(work_dir, "*.vcd"))
+        vcd_path = found[0] if found else None
+
     if sim_result.returncode != 0:
-        return False, "SIMULATION ERROR:\n" + sim_result.stderr, False
+        return False, "SIMULATION ERROR:\n" + sim_result.stderr, False, vcd_path
 
     # Compiled and ran cleanly — but did the self-checks actually pass?
     output_upper = sim_result.stdout.upper()
     has_fail = "FAIL" in output_upper
-    has_pass = "PASS" in output_upper
 
     if has_fail:
         # Ran fine mechanically, but functional self-checks failed.
@@ -205,96 +246,345 @@ def compile_and_simulate(verilog_code, module_name, work_dir):
             "but self-check assertions failed):\n" + fail_lines +
             "\n\nFull simulation output:\n" + sim_result.stdout
         )
-        return False, functional_report, False
+        return False, functional_report, False, vcd_path
 
-    return True, sim_result.stdout, True
+    return True, sim_result.stdout, True, vcd_path
 
-# ── MAIN GENERATION FLOW ────────────────────────────────────────
-if generate_clicked:
-    if not api_key:
-        st.error("⚠️ Please enter your Gemini API key in the sidebar first.")
-        st.stop()
-    if not description.strip():
-        st.error("⚠️ Please describe the chip you want to generate.")
-        st.stop()
+# ── WAVEFORM (VCD) HELPERS ──────────────────────────────────────
+def load_vcd_signals(vcd_path):
+    """Parse a VCD file and return (vcd_obj, default_signal_list, all_signal_list)."""
+    from vcdvcd import VCDVCD
+    vcd = VCDVCD(vcd_path)
+    all_signals = list(vcd.signals)
+    if not all_signals:
+        return vcd, [], []
+    # Default view = signals at the shallowest hierarchy depth (the testbench's own
+    # top-level wires/regs, which mirror the DUT's ports) so the default chart isn't
+    # cluttered with duplicated internal DUT signals. User can add more via multiselect.
+    depths = [s.count(".") for s in all_signals]
+    min_depth = min(depths)
+    default_signals = [s for s, d in zip(all_signals, depths) if d == min_depth]
+    return vcd, default_signals, all_signals
 
-    work_dir = tempfile.mkdtemp()
-    attempt = 0
-    success = False
-    current_code = ""
-    sim_output = ""
-    history = []
+def render_waveform_figure(vcd, signal_names):
+    """Build a plotly digital timing-diagram figure for the given signals."""
+    import plotly.graph_objects as go
 
-    with st.status("Generating and verifying Verilog...", expanded=True) as status:
-        st.write("🤖 Asking Gemini to generate initial Verilog code... (auto-retries if server is busy)")
-        try:
-            prompt = build_generation_prompt(description, module_name)
-            raw_response = call_gemini(prompt, api_key)
-            current_code = extract_verilog_code(raw_response)
-        except Exception as e:
-            status.update(label="❌ API call failed", state="error")
-            st.error(f"Error calling Gemini API: {e}")
+    if not signal_names:
+        return None
+
+    all_tvs = [vcd[s].tv for s in signal_names if vcd[s].tv]
+    if not all_tvs:
+        return None
+    end_time = max(tv[-1][0] for tv in all_tvs)
+    end_time = end_time + max(1, int(end_time * 0.05))
+
+    fig = go.Figure()
+    row_height = 1.3
+    n = len(signal_names)
+
+    for i, sig in enumerate(signal_names):
+        tv = vcd[sig].tv
+        y_base = (n - 1 - i) * row_height
+        is_bus = "[" in sig or (tv and len(tv[0][1]) > 1)
+        xs, ys = [], []
+        labels = []
+        for idx, (t, v) in enumerate(tv):
+            v_clean = v.replace("x", "0").replace("z", "0") if v else "0"
+            t_end = tv[idx + 1][0] if idx + 1 < len(tv) else end_time
+            if is_bus:
+                try:
+                    val_disp = str(int(v_clean, 2))
+                except ValueError:
+                    val_disp = v
+                xs += [t, t_end, None]
+                ys += [y_base + 0.5, y_base + 0.5, None]
+                labels.append((t, t_end, y_base + 0.85, val_disp))
+            else:
+                level = 1 if v_clean.strip() == "1" else 0
+                xs += [t, t_end, t_end]
+                ys += [y_base + level, y_base + level, y_base + level]
+
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=sig,
+            line=dict(width=2, shape="hv"), showlegend=False
+        ))
+        if is_bus:
+            for (t0, t1, ytxt, label) in labels:
+                mid = t0 + (t1 - t0) / 2
+                fig.add_annotation(x=mid, y=ytxt, text=label, showarrow=False,
+                                    font=dict(size=10, color="#C9A84C"))
+        fig.add_annotation(x=-end_time * 0.02, y=y_base + 0.5, text=f"<b>{sig}</b>",
+                            showarrow=False, xanchor="right", font=dict(size=11))
+
+    fig.update_layout(
+        height=max(220, 70 * n),
+        margin=dict(l=160, r=20, t=20, b=40),
+        plot_bgcolor="#0D1117", paper_bgcolor="#0D1117",
+        xaxis=dict(title="Time (simulation units)", showgrid=True, gridcolor="#222"),
+        yaxis=dict(showticklabels=False, showgrid=False, range=[-0.3, n * row_height]),
+        font=dict(color="#E6EDF3"),
+    )
+    return fig
+
+# ── GALLERY EXPORT ──────────────────────────────────────────────
+def export_gallery_html(gallery):
+    cards = []
+    for entry in gallery:
+        bug_html = ""
+        if entry.get("bug_stories"):
+            stories = "".join(
+                f"<div class='bug'><b>Attempt {b['attempt']}:</b> {html_lib.escape(b['explanation'])}</div>"
+                for b in entry["bug_stories"]
+            )
+            bug_html = f"<h4>Bug story</h4>{stories}"
+        cards.append(f"""
+        <div class="card">
+            <h3>{html_lib.escape(entry['module_name'])}</h3>
+            <p class="desc">{html_lib.escape(entry['description'])}</p>
+            <p class="meta">Verified {html_lib.escape(entry['timestamp'])} · {entry['attempts']} attempt(s)</p>
+            {bug_html}
+            <h4>Verilog code</h4>
+            <pre>{html_lib.escape(entry['code'])}</pre>
+            <h4>Simulation output</h4>
+            <pre>{html_lib.escape(entry['sim_output'])}</pre>
+        </div>
+        """)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>RTL Gen — Verified Design Gallery</title>
+<style>
+body {{ background:#0D1117; color:#E6EDF3; font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:32px; }}
+h1 {{ color:#C9A84C; }}
+.card {{ background:#161B22; border:1px solid #30363D; border-radius:8px; padding:20px 24px; margin-bottom:24px; }}
+.desc {{ color:#90CAF9; }}
+.meta {{ color:#8B949E; font-size:12px; }}
+pre {{ background:#0D1117; border:1px solid #30363D; border-radius:6px; padding:12px; overflow-x:auto; font-size:12px; }}
+.bug {{ background:#2B1A1A; border-left:3px solid #E57373; padding:8px 12px; margin:6px 0; border-radius:4px; font-size:13px; }}
+</style></head>
+<body>
+<h1>⚡ RTL Gen — Verified Design Gallery</h1>
+<p class="meta">Sahastra Mudra Semiconductors · exported {html_lib.escape(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}</p>
+{"".join(cards) if cards else "<p>No verified designs yet.</p>"}
+</body></html>"""
+
+# ── MAIN INPUT ──────────────────────────────────────────────────
+tab_generate, tab_gallery = st.tabs(["🛠️ Generate & Verify", f"🖼️ Verified Gallery ({len(st.session_state['gallery'])})"])
+
+with tab_generate:
+    description = st.text_area(
+        "Describe the chip / module you want in plain English",
+        value=st.session_state["prompt_text"],
+        height=100,
+        placeholder="e.g. A 4-bit binary counter with synchronous reset and enable input"
+    )
+
+    module_name = st.text_input("Module name (must match Verilog module name)", value="my_module")
+
+    col_gen, col_clear = st.columns([1, 5])
+    generate_clicked = col_gen.button("⚡ Generate & Verify", type="primary", use_container_width=True)
+
+    if generate_clicked:
+        if not api_key:
+            st.error("⚠️ Please enter your Gemini API key in the sidebar first.")
+            st.stop()
+        if not description.strip():
+            st.error("⚠️ Please describe the chip you want to generate.")
             st.stop()
 
-        history.append({"attempt": 0, "code": current_code, "result": "Generated, testing now..."})
+        work_dir = tempfile.mkdtemp()
+        attempt = 0
+        success = False
+        current_code = ""
+        sim_output = ""
+        vcd_path = None
+        history = []
+        bug_stories = []
 
-        while attempt < max_retries and not success:
-            st.write(f"🔧 Attempt {attempt + 1}: compiling with Icarus Verilog...")
-            success, output, functional_pass = compile_and_simulate(current_code, module_name, work_dir)
+        with st.status("Generating and verifying Verilog...", expanded=True) as status:
+            st.write("🤖 Asking Gemini to generate initial Verilog code... (auto-retries if server is busy)")
+            try:
+                prompt = build_generation_prompt(description, module_name)
+                raw_response = call_gemini(prompt, api_key)
+                current_code = extract_verilog_code(raw_response)
+            except Exception as e:
+                status.update(label="❌ API call failed", state="error")
+                st.error(f"Error calling Gemini API: {e}")
+                st.stop()
+
+            history.append({"attempt": 0, "code": current_code, "result": "Generated, testing now...", "explanation": None})
+
+            while attempt < max_retries and not success:
+                st.write(f"🔧 Attempt {attempt + 1}: compiling with Icarus Verilog...")
+                success, output, functional_pass, this_vcd = compile_and_simulate(current_code, module_name, work_dir)
+
+                if success:
+                    sim_output = output
+                    vcd_path = this_vcd
+                    st.write("✅ Compiled, simulated, AND all self-checks passed!")
+                    history[-1]["result"] = "✅ Success — fully verified"
+                    break
+                else:
+                    is_functional = "FUNCTIONAL VERIFICATION FAILURE" in output
+                    if is_functional:
+                        st.write(f"⚠️ Attempt {attempt + 1}: compiled fine, but self-checks FAILED — asking Gemini to explain and debug...")
+                        history[-1]["result"] = f"⚠️ Functional bug: {output[:200]}"
+                    else:
+                        st.write(f"❌ Attempt {attempt + 1} failed to compile — asking Gemini to explain and fix it...")
+                        history[-1]["result"] = f"❌ Compile error: {output[:200]}"
+
+                    explanation = explain_bug(output, description, module_name, api_key)
+                    if explanation:
+                        history[-1]["explanation"] = explanation
+                        bug_stories.append({"attempt": attempt + 1, "explanation": explanation})
+                        st.markdown(f"<div class='bug-box'><b>Root cause:</b> {explanation}</div>", unsafe_allow_html=True)
+
+                    fix_prompt = build_fix_prompt(current_code, output, description, module_name)
+                    try:
+                        raw_response = call_gemini(fix_prompt, api_key)
+                        current_code = extract_verilog_code(raw_response)
+                        history.append({"attempt": attempt + 1, "code": current_code, "result": "Fixing...", "explanation": None})
+                    except Exception as e:
+                        st.error(f"Error calling Gemini API during fix attempt: {e}")
+                        break
+                attempt += 1
 
             if success:
-                sim_output = output
-                st.write("✅ Compiled, simulated, AND all self-checks passed!")
-                history[-1]["result"] = "✅ Success — fully verified"
-                break
+                status.update(label="✅ Verified working Verilog generated!", state="complete")
             else:
-                if "FUNCTIONAL VERIFICATION FAILURE" in output:
-                    st.write(f"⚠️ Attempt {attempt + 1}: compiled fine, but self-checks FAILED — asking Gemini to debug...")
-                    history[-1]["result"] = f"⚠️ Functional bug: {output[:200]}"
-                else:
-                    st.write(f"❌ Attempt {attempt + 1} failed to compile — asking Gemini to fix it...")
-                    history[-1]["result"] = f"❌ Compile error: {output[:200]}"
-                fix_prompt = build_fix_prompt(current_code, output, description, module_name)
-                try:
-                    raw_response = call_gemini(fix_prompt, api_key)
-                    current_code = extract_verilog_code(raw_response)
-                    history.append({"attempt": attempt + 1, "code": current_code, "result": "Fixing..."})
-                except Exception as e:
-                    st.error(f"Error calling Gemini API during fix attempt: {e}")
-                    break
-            attempt += 1
+                status.update(label=f"⚠️ Could not get working code after {max_retries} attempts", state="error")
+
+        st.divider()
 
         if success:
-            status.update(label="✅ Verified working Verilog generated!", state="complete")
-        else:
-            status.update(label=f"⚠️ Could not get working code after {max_retries} attempts", state="error")
+            st.success(f"✅ **FULLY VERIFIED** — Compiled, simulated, and ALL self-check assertions passed after {attempt + 1} attempt(s)")
 
-    st.divider()
+            if bug_stories:
+                with st.expander(f"🩺 Bug story — {len(bug_stories)} issue(s) hit and fixed along the way", expanded=True):
+                    for b in bug_stories:
+                        st.markdown(f"<div class='bug-box'><b>Attempt {b['attempt']}:</b> {b['explanation']}</div>", unsafe_allow_html=True)
 
-    if success:
-        st.success(f"✅ **FULLY VERIFIED** — Compiled, simulated, and ALL self-check assertions passed after {attempt + 1} attempt(s)")
+            col1, col2 = st.columns([3, 2])
+            with col1:
+                st.markdown("#### Generated Verilog Code")
+                st.code(current_code, language="verilog", line_numbers=True)
+                st.download_button("📥 Download .v file", data=current_code,
+                                   file_name=f"{module_name}.v", mime="text/plain")
+            with col2:
+                st.markdown("#### Simulation Output")
+                st.code(sim_output, language=None)
+                st.success("All self-check assertions passed")
 
-        col1, col2 = st.columns([3, 2])
-        with col1:
-            st.markdown("#### Generated Verilog Code")
-            st.code(current_code, language="verilog", line_numbers=True)
-            st.download_button("📥 Download .v file", data=current_code,
-                               file_name=f"{module_name}.v", mime="text/plain")
-        with col2:
-            st.markdown("#### Simulation Output")
-            st.code(sim_output, language=None)
-            st.success("All self-check assertions passed")
-    else:
-        st.error(f"⚠️ Could not produce fully passing code after {max_retries} attempts.")
-        st.caption("This can happen with more complex designs — try increasing 'Max auto-fix attempts' in the sidebar, or simplify the description.")
-        st.markdown("#### Last attempted code (still has issues)")
-        st.code(current_code, language="verilog")
-
-    with st.expander("🔍 View full attempt history"):
-        for h in history:
-            st.markdown(f"**Attempt {h['attempt']}** — {h['result']}")
-            st.code(h["code"], language="verilog")
             st.divider()
+            st.markdown("#### 📊 Waveform")
+            vcd_bytes = None
+            if vcd_path and os.path.exists(vcd_path):
+                try:
+                    vcd_obj, default_signals, all_signals = load_vcd_signals(vcd_path)
+                    with open(vcd_path, "rb") as f:
+                        vcd_bytes = f.read()
+                    chosen = st.multiselect("Signals to plot", options=all_signals, default=default_signals, key="wave_signals")
+                    fig = render_waveform_figure(vcd_obj, chosen)
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No signal data to plot — select at least one signal above.")
+                    st.download_button("📥 Download .vcd (open in GTKWave for a full-detail view)",
+                                        data=vcd_bytes, file_name=f"{module_name}.vcd", mime="text/plain")
+                except Exception as e:
+                    st.warning(f"Waveform captured but could not be rendered here ({e}). You can still download the raw .vcd below.")
+                    try:
+                        with open(vcd_path, "rb") as f:
+                            vcd_bytes = f.read()
+                        st.download_button("📥 Download .vcd", data=vcd_bytes, file_name=f"{module_name}.vcd", mime="text/plain")
+                    except Exception:
+                        pass
+            else:
+                st.info("No waveform dump was found for this design — the AI-generated testbench may not have included the `$dumpfile`/`$dumpvars` lines. This doesn't affect the verification result above.")
 
-else:
-    st.info("👈 Enter a description, paste your Gemini API key in the sidebar, and click **Generate & Verify** to get started. Try one of the example prompts in the sidebar first.")
+            # Add to session gallery
+            already_in_gallery = any(
+                g["module_name"] == module_name and g["description"] == description and g["code"] == current_code
+                for g in st.session_state["gallery"]
+            )
+            if not already_in_gallery:
+                st.session_state["gallery"].append({
+                    "module_name": module_name,
+                    "description": description,
+                    "code": current_code,
+                    "sim_output": sim_output,
+                    "attempts": attempt + 1,
+                    "bug_stories": bug_stories,
+                    "vcd_bytes": vcd_bytes,
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                })
+                st.toast(f"Added '{module_name}' to the Verified Gallery →", icon="🖼️")
+        else:
+            st.error(f"⚠️ Could not produce fully passing code after {max_retries} attempts.")
+            st.caption("This can happen with more complex designs — try increasing 'Max auto-fix attempts' in the sidebar, or simplify the description.")
+            if bug_stories:
+                with st.expander("🩺 What went wrong on each attempt", expanded=True):
+                    for b in bug_stories:
+                        st.markdown(f"<div class='bug-box'><b>Attempt {b['attempt']}:</b> {b['explanation']}</div>", unsafe_allow_html=True)
+            st.markdown("#### Last attempted code (still has issues)")
+            st.code(current_code, language="verilog")
+
+        with st.expander("🔍 View full attempt history"):
+            for h in history:
+                st.markdown(f"**Attempt {h['attempt']}** — {h['result']}")
+                if h.get("explanation"):
+                    st.markdown(f"<div class='bug-box'><b>Root cause:</b> {h['explanation']}</div>", unsafe_allow_html=True)
+                st.code(h["code"], language="verilog")
+                st.divider()
+
+    else:
+        st.info("👈 Enter a description, paste your Gemini API key in the sidebar, and click **Generate & Verify** to get started. Try one of the example prompts in the sidebar first.")
+
+with tab_gallery:
+    gallery = st.session_state["gallery"]
+    st.markdown("#### 🖼️ Verified Design Gallery")
+    st.caption("Every design that passed compilation, simulation, AND all self-checks in this session — a running portfolio you can export and share.")
+
+    if not gallery:
+        st.info("No verified designs yet. Generate one in the **Generate & Verify** tab and it will show up here automatically.")
+    else:
+        export_html = export_gallery_html(gallery)
+        st.download_button("📤 Export gallery as a shareable HTML page", data=export_html,
+                            file_name="rtl_gen_gallery.html", mime="text/html",
+                            help="A self-contained HTML file you can host on GitHub Pages, attach to an email, or send to anyone — no login needed to view it.")
+        st.divider()
+
+        for i, entry in enumerate(reversed(gallery)):
+            with st.container(border=True):
+                st.markdown(f"### {entry['module_name']}")
+                st.caption(f"{entry['description']}")
+                st.caption(f"Verified {entry['timestamp']} · {entry['attempts']} attempt(s)")
+
+                if entry["bug_stories"]:
+                    with st.expander(f"🩺 Bug story ({len(entry['bug_stories'])} issue(s) hit and fixed)"):
+                        for b in entry["bug_stories"]:
+                            st.markdown(f"<div class='bug-box'><b>Attempt {b['attempt']}:</b> {b['explanation']}</div>", unsafe_allow_html=True)
+
+                gcol1, gcol2 = st.columns([3, 2])
+                with gcol1:
+                    with st.expander("View Verilog code"):
+                        st.code(entry["code"], language="verilog")
+                with gcol2:
+                    with st.expander("View simulation output"):
+                        st.code(entry["sim_output"], language=None)
+
+                if entry.get("vcd_bytes"):
+                    with st.expander("View waveform"):
+                        try:
+                            tmp_path = os.path.join(tempfile.mkdtemp(), "gallery.vcd")
+                            with open(tmp_path, "wb") as f:
+                                f.write(entry["vcd_bytes"])
+                            vcd_obj, default_signals, all_signals = load_vcd_signals(tmp_path)
+                            chosen = st.multiselect("Signals", options=all_signals, default=default_signals, key=f"gallery_wave_{i}")
+                            fig = render_waveform_figure(vcd_obj, chosen)
+                            if fig is not None:
+                                st.plotly_chart(fig, use_container_width=True, key=f"gallery_chart_{i}")
+                        except Exception as e:
+                            st.caption(f"Waveform unavailable ({e})")
+                        st.download_button("📥 Download .vcd", data=entry["vcd_bytes"],
+                                            file_name=f"{entry['module_name']}.vcd", mime="text/plain",
+                                            key=f"gallery_vcd_dl_{i}")
