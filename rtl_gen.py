@@ -295,11 +295,26 @@ def render_waveform_figure(vcd, signal_names):
     row_height = 1.3
     n = len(signal_names)
 
+    # Every transition timestamp across all plotted signals, so a faint vertical
+    # guide can be drawn at each one -- this makes a value change visible even
+    # when its text label had to be skipped for crowding (below).
+    all_transition_times = set()
+    for sig in signal_names:
+        for (t, _v) in vcd[sig].tv:
+            all_transition_times.add(t)
+
+    # Minimum on-screen segment width, as a fraction of the total time span, a
+    # bus value needs before its text label is drawn. Narrower segments than
+    # this would visually overlap their neighbors during fast value changes
+    # (e.g. an opcode bus switching every few cycles), so the label is skipped
+    # there and the exact value is still available on hover instead.
+    MIN_LABEL_FRAC = 0.05
+
     for i, sig in enumerate(signal_names):
         tv = vcd[sig].tv
         y_base = (n - 1 - i) * row_height
         is_bus = "[" in sig or (tv and len(tv[0][1]) > 1)
-        xs, ys = [], []
+        xs, ys, hover_texts = [], [], []
         labels = []
         for idx, (t, v) in enumerate(tv):
             v_clean = v.replace("x", "0").replace("z", "0") if v else "0"
@@ -311,23 +326,42 @@ def render_waveform_figure(vcd, signal_names):
                     val_disp = v
                 xs += [t, t_end, None]
                 ys += [y_base + 0.5, y_base + 0.5, None]
-                labels.append((t, t_end, y_base + 0.85, val_disp))
+                hover_texts += [f"{sig} = {val_disp}<br>t = {t}",
+                                 f"{sig} = {val_disp}<br>t = {t_end}", None]
+                seg_width = t_end - t
+                if seg_width >= end_time * MIN_LABEL_FRAC:
+                    mid = t + seg_width / 2
+                    labels.append((mid, y_base + 0.85, val_disp))
             else:
                 level = 1 if v_clean.strip() == "1" else 0
                 xs += [t, t_end, t_end]
                 ys += [y_base + level, y_base + level, y_base + level]
+                hover_texts += [f"{sig} = {level}<br>t = {t}",
+                                 f"{sig} = {level}<br>t = {t_end}",
+                                 f"{sig} = {level}<br>t = {t_end}"]
 
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines", name=sig,
-            line=dict(width=2, shape="hv"), showlegend=False
+            line=dict(width=2, shape="hv"), showlegend=False,
+            hovertext=hover_texts, hoverinfo="text",
         ))
-        if is_bus:
-            for (t0, t1, ytxt, label) in labels:
-                mid = t0 + (t1 - t0) / 2
-                fig.add_annotation(x=mid, y=ytxt, text=label, showarrow=False,
-                                    font=dict(size=10, color="#C9A84C"))
+        for (mid, ytxt, label) in labels:
+            fig.add_annotation(x=mid, y=ytxt, text=label, showarrow=False,
+                                font=dict(size=10, color="#C9A84C"))
         fig.add_annotation(x=-end_time * 0.02, y=y_base + 0.5, text=f"<b>{sig}</b>",
                             showarrow=False, xanchor="right", font=dict(size=11))
+
+    # Faint vertical guide at every transition, capped so a very fast-toggling
+    # signal (e.g. a clock included in the same view) doesn't turn the chart
+    # into a solid wall of lines.
+    if 0 < len(all_transition_times) <= 60:
+        for t in sorted(all_transition_times):
+            if 0 < t < end_time:
+                fig.add_shape(
+                    type="line", x0=t, x1=t, y0=-0.3, y1=n * row_height,
+                    line=dict(color="#2A2F3A", width=1, dash="dot"),
+                    layer="below",
+                )
 
     fig.update_layout(
         height=max(220, 70 * n),
