@@ -459,6 +459,47 @@ def render_svg_html(svg_bytes, max_height=600):
     </div>
     """
 
+SCHEMATIC_GUIDE_MD = """
+**Shapes**
+- **Octagons** — top-level module ports (inputs/outputs like `clk`, `rst`, `enable`).
+- **Boxes with C/D/E/R pins** (`$_SDFFE_PP0_`, `$_DFF_PP0_`, etc.) — flip-flops, i.e. the design's *state*. The cell name decodes the behavior: `S`ynchronous, `D` flip-flop, `E`nable, `P`ositive-edge clock, `P`ositive-edge reset, reset value `0`.
+- **Small boxes with A/B/Y pins** (`$_NOT_`, `$_XOR_`, `$_NAND_`, `$_AND_`, `$_MUX_`, ...) — combinational logic gates that compute the *next* value.
+- **Rounded pill labels** like `2:2 - 0:0` — not gates, just bit-select/reindex markers showing which bit of a multi-bit bus maps to which pin.
+
+**How to trace it**
+1. Find the flip-flops — that's your register / stored state.
+2. Follow their `Q` (output) into the combinational cloud in the middle.
+3. That cloud computes the next value, which feeds back into the `D` (input) of the same flip-flops — this loop *is* the register's update logic (e.g. `count <= count + 1`).
+4. `rst` and `enable` (if present) usually feed the `R`/`E` pins directly, controlling when that update actually happens.
+
+**Why the gates look unfamiliar**
+Yosys's optimizer (`abc`) doesn't keep literal adders/multiplexers from your Verilog — it reduces the logic to a minimal set of primitive boolean gates. So an `a + b` in your RTL might synthesize down to a chain of XOR/AND/OR gates that don't look like "an adder" at a glance. That's expected and is a sign optimization worked, not a bug.
+
+**Quick sanity check**
+Compare the flip-flop count here to your expected register width (e.g. a 4-bit counter should show 4 flip-flops), and check the cell/wire stats shown above the schematic — those come straight from Yosys's `stat` pass.
+"""
+
+SCHEMATIC_GUIDE_HTML = """
+<p><b>Shapes</b></p>
+<ul>
+<li><b>Octagons</b> — top-level module ports (inputs/outputs like <code>clk</code>, <code>rst</code>, <code>enable</code>).</li>
+<li><b>Boxes with C/D/E/R pins</b> (<code>$_SDFFE_PP0_</code>, <code>$_DFF_PP0_</code>, etc.) — flip-flops, i.e. the design's <i>state</i>. The cell name decodes the behavior: Synchronous, D flip-flop, Enable, Positive-edge clock, Positive-edge reset, reset value 0.</li>
+<li><b>Small boxes with A/B/Y pins</b> (<code>$_NOT_</code>, <code>$_XOR_</code>, <code>$_NAND_</code>, <code>$_AND_</code>, <code>$_MUX_</code>, ...) — combinational logic gates that compute the <i>next</i> value.</li>
+<li><b>Rounded pill labels</b> like <code>2:2 - 0:0</code> — not gates, just bit-select/reindex markers showing which bit of a multi-bit bus maps to which pin.</li>
+</ul>
+<p><b>How to trace it</b></p>
+<ol>
+<li>Find the flip-flops — that's your register / stored state.</li>
+<li>Follow their Q (output) into the combinational cloud in the middle.</li>
+<li>That cloud computes the next value, which feeds back into the D (input) of the same flip-flops — this loop <i>is</i> the register's update logic (e.g. <code>count &lt;= count + 1</code>).</li>
+<li><code>rst</code> and <code>enable</code> (if present) usually feed the R/E pins directly, controlling when that update actually happens.</li>
+</ol>
+<p><b>Why the gates look unfamiliar</b><br>
+Yosys's optimizer (<code>abc</code>) doesn't keep literal adders/multiplexers from your Verilog — it reduces the logic to a minimal set of primitive boolean gates. An <code>a + b</code> in your RTL might synthesize down to a chain of XOR/AND/OR gates that don't look like "an adder" at a glance. That's expected, and a sign optimization worked, not a bug.</p>
+<p><b>Quick sanity check</b><br>
+Compare the flip-flop count here to your expected register width (e.g. a 4-bit counter should show 4 flip-flops), and check the cell/wire stats shown above — those come straight from Yosys's <code>stat</code> pass.</p>
+"""
+
 # ── GALLERY EXPORT ──────────────────────────────────────────────
 def export_gallery_html(gallery):
     cards = []
@@ -470,6 +511,28 @@ def export_gallery_html(gallery):
                 for b in entry["bug_stories"]
             )
             bug_html = f"<h4>Bug story</h4>{stories}"
+
+        synth_html = ""
+        if entry.get("synth_svg"):
+            stats = entry.get("synth_stats") or {}
+            stats_line = ""
+            if stats.get("cells_total") is not None:
+                stats_line = f"<p class='meta'>{stats['cells_total']} gate-level cells · {stats.get('wires', '—')} wires</p>"
+            b64 = base64.b64encode(entry["synth_svg"]).decode()
+            netlist_html = ""
+            if entry.get("synth_netlist"):
+                netlist_html = f"""
+                <h4>Synthesized gate-level netlist</h4>
+                <pre>{html_lib.escape(entry['synth_netlist'])}</pre>
+                """
+            synth_html = f"""
+            <h4>Gate-level schematic (Yosys synthesis)</h4>
+            {stats_line}
+            <div class="schematic"><img src="data:image/svg+xml;base64,{b64}" style="max-width:none;" /></div>
+            {netlist_html}
+            <details class="guide"><summary>🔍 How to read this schematic</summary>{SCHEMATIC_GUIDE_HTML}</details>
+            """
+
         cards.append(f"""
         <div class="card">
             <h3>{html_lib.escape(entry['module_name'])}</h3>
@@ -480,6 +543,7 @@ def export_gallery_html(gallery):
             <pre>{html_lib.escape(entry['code'])}</pre>
             <h4>Simulation output</h4>
             <pre>{html_lib.escape(entry['sim_output'])}</pre>
+            {synth_html}
         </div>
         """)
     return f"""<!DOCTYPE html>
@@ -492,6 +556,10 @@ h1 {{ color:#C9A84C; }}
 .meta {{ color:#8B949E; font-size:12px; }}
 pre {{ background:#0D1117; border:1px solid #30363D; border-radius:6px; padding:12px; overflow-x:auto; font-size:12px; }}
 .bug {{ background:#2B1A1A; border-left:3px solid #E57373; padding:8px 12px; margin:6px 0; border-radius:4px; font-size:13px; }}
+.schematic {{ background:#ffffff; border:1px solid #30363D; border-radius:6px; padding:12px; overflow:auto; max-height:600px; }}
+.guide {{ background:#161B22; border:1px solid #30363D; border-radius:6px; padding:10px 14px; margin-top:10px; font-size:13px; }}
+.guide summary {{ cursor:pointer; color:#C9A84C; font-weight:600; }}
+.guide p, .guide li {{ color:#C9D1D9; }}
 </style></head>
 <body>
 <h1>⚡ RTL Gen — Verified Design Gallery</h1>
@@ -655,6 +723,8 @@ with tab_generate:
                     st.components.v1.html(render_svg_html(synth_svg), height=620, scrolling=True)
                     st.download_button("📥 Download schematic (.svg)", data=synth_svg,
                                         file_name=f"{module_name}_schematic.svg", mime="image/svg+xml")
+                    with st.expander("🔍 How to read this schematic"):
+                        st.markdown(SCHEMATIC_GUIDE_MD)
                 if synth_netlist:
                     with st.expander("View synthesized gate-level netlist (Verilog)"):
                         st.code(synth_netlist, language="verilog")
@@ -768,3 +838,5 @@ with tab_gallery:
                             st.download_button("📥 Download netlist (.v)", data=entry["synth_netlist"],
                                                 file_name=f"{entry['module_name']}_netlist.v", mime="text/plain",
                                                 key=f"gallery_netlist_dl_{i}")
+                        with st.expander("🔍 How to read this schematic", expanded=False):
+                            st.markdown(SCHEMATIC_GUIDE_MD)
