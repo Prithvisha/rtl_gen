@@ -9,7 +9,13 @@ import shutil
 import json
 import glob
 import html as html_lib
+import base64
 from datetime import datetime, timezone
+
+def find_yosys():
+    return shutil.which("yosys") or "yosys"
+
+YOSYS_PATH = find_yosys()
 
 def find_executable(name):
     """Find an executable, checking PATH first, then common Windows install locations."""
@@ -77,6 +83,12 @@ with st.sidebar:
         st.success("✅ Waveform engine ready")
     except ImportError:
         st.error("❌ 'vcdvcd' package missing — add it to requirements.txt")
+
+    if shutil.which("yosys") or os.path.exists(YOSYS_PATH):
+        st.success("✅ Yosys synthesis engine found")
+    else:
+        st.error("❌ Yosys NOT found")
+        st.caption("Install Yosys (apt-get install yosys) to enable gate-level synthesis")
 
     st.divider()
     st.markdown("### 📚 Example prompts")
@@ -327,6 +339,92 @@ def render_waveform_figure(vcd, signal_names):
     )
     return fig
 
+# ── SYNTHESIS (YOSYS) HELPERS ────────────────────────────────────
+def extract_design_module(combined_code, module_name):
+    """Pull just the target design module (not the testbench) out of the combined code."""
+    pattern = rf'\bmodule\s+{re.escape(module_name)}\b.*?endmodule'
+    m = re.search(pattern, combined_code, re.DOTALL)
+    if m:
+        return m.group(0)
+    return None
+
+def synthesize_design(verilog_code, module_name, work_dir):
+    """
+    Run open-source Yosys synthesis on just the design module (testbench stripped out).
+    Returns (success, message, stats_dict_or_None, svg_bytes_or_None, netlist_code_or_None).
+    """
+    design_only = extract_design_module(verilog_code, module_name)
+    if design_only is None:
+        return False, f"Could not isolate module '{module_name}' from the generated code for synthesis.", None, None, None
+
+    synth_dir = tempfile.mkdtemp(dir=work_dir)
+    design_file = os.path.join(synth_dir, f"{module_name}_design.v")
+    netlist_file = os.path.join(synth_dir, f"{module_name}_netlist.v")
+    svg_prefix = os.path.join(synth_dir, f"{module_name}_schem")
+
+    with open(design_file, "w") as f:
+        f.write(design_only)
+
+    yosys_script = (
+        f"read_verilog {design_file}; "
+        f"synth -top {module_name}; "
+        f"stat; "
+        f"write_verilog -noattr {netlist_file}; "
+        f"show -format svg -prefix {svg_prefix} {module_name}"
+    )
+
+    try:
+        result = subprocess.run(
+            [YOSYS_PATH, "-p", yosys_script],
+            capture_output=True, text=True, timeout=60, cwd=synth_dir
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Synthesis timed out (design may be too large or complex for this quick pass).", None, None, None
+    except FileNotFoundError:
+        return False, "Yosys is not installed on this host.", None, None, None
+
+    if result.returncode != 0:
+        return False, "SYNTHESIS ERROR:\n" + result.stdout[-2000:] + "\n" + result.stderr[-2000:], None, None, None
+
+    # Parse the cell/wire stats block out of Yosys's stdout
+    stats = {"cells_total": None, "cell_types": {}, "wires": None}
+    stat_section = re.search(r"=== .* ===\n(.*?)(?=\n\n|\Z)", result.stdout, re.DOTALL)
+    if stat_section:
+        block = stat_section.group(1)
+        m_wires = re.search(r"Number of wires:\s+(\d+)", block)
+        m_cells = re.search(r"Number of cells:\s+(\d+)", block)
+        if m_wires:
+            stats["wires"] = int(m_wires.group(1))
+        if m_cells:
+            stats["cells_total"] = int(m_cells.group(1))
+        for line in block.splitlines():
+            cm = re.match(r"\s+(\$\S+)\s+(\d+)", line)
+            if cm:
+                stats["cell_types"][cm.group(1)] = int(cm.group(2))
+
+    svg_path = svg_prefix + ".svg"
+    svg_bytes = None
+    if os.path.exists(svg_path):
+        with open(svg_path, "rb") as f:
+            svg_bytes = f.read()
+
+    netlist_code = None
+    if os.path.exists(netlist_file):
+        with open(netlist_file) as f:
+            netlist_code = f.read()
+
+    return True, result.stdout, stats, svg_bytes, netlist_code
+
+def render_svg_html(svg_bytes, max_height=600):
+    """Embed SVG bytes as a base64 <img> inside a scrollable, dark-backed container."""
+    b64 = base64.b64encode(svg_bytes).decode()
+    return f"""
+    <div style="background:#ffffff; border:1px solid #30363D; border-radius:6px;
+                padding:12px; overflow:auto; max-height:{max_height}px;">
+        <img src="data:image/svg+xml;base64,{b64}" style="max-width:none;" />
+    </div>
+    """
+
 # ── GALLERY EXPORT ──────────────────────────────────────────────
 def export_gallery_html(gallery):
     cards = []
@@ -501,6 +599,37 @@ with tab_generate:
             else:
                 st.info("No waveform dump was found for this design — the AI-generated testbench may not have included the `$dumpfile`/`$dumpvars` lines. This doesn't affect the verification result above.")
 
+            st.divider()
+            st.markdown("#### 📐 Gate-Level Synthesis")
+            st.caption("Synthesized from RTL to a real gate-level netlist using Yosys (open-source synthesis).")
+            synth_stats, synth_svg, synth_netlist = None, None, None
+            with st.spinner("Running Yosys synthesis..."):
+                synth_ok, synth_msg, synth_stats, synth_svg, synth_netlist = synthesize_design(
+                    current_code, module_name, work_dir
+                )
+            if synth_ok:
+                if synth_stats and synth_stats.get("cells_total") is not None:
+                    scol1, scol2 = st.columns(2)
+                    scol1.metric("Total gate-level cells", synth_stats["cells_total"])
+                    scol2.metric("Wires", synth_stats["wires"] if synth_stats["wires"] is not None else "—")
+                    if synth_stats["cell_types"]:
+                        with st.expander("Cell type breakdown"):
+                            for cname, ccount in sorted(synth_stats["cell_types"].items(), key=lambda x: -x[1]):
+                                st.markdown(f"- `{cname}` × {ccount}")
+                if synth_svg:
+                    st.markdown("**Schematic**")
+                    st.components.v1.html(render_svg_html(synth_svg), height=620, scrolling=True)
+                    st.download_button("📥 Download schematic (.svg)", data=synth_svg,
+                                        file_name=f"{module_name}_schematic.svg", mime="image/svg+xml")
+                if synth_netlist:
+                    with st.expander("View synthesized gate-level netlist (Verilog)"):
+                        st.code(synth_netlist, language="verilog")
+                        st.download_button("📥 Download netlist (.v)", data=synth_netlist,
+                                            file_name=f"{module_name}_netlist.v", mime="text/plain")
+            else:
+                st.warning(f"Synthesis could not be completed for this design: {synth_msg[:300]}")
+                st.caption("This doesn't affect the simulation/verification result above — synthesis is an additional, separate check.")
+
             # Add to session gallery
             already_in_gallery = any(
                 g["module_name"] == module_name and g["description"] == description and g["code"] == current_code
@@ -515,6 +644,9 @@ with tab_generate:
                     "attempts": attempt + 1,
                     "bug_stories": bug_stories,
                     "vcd_bytes": vcd_bytes,
+                    "synth_stats": synth_stats,
+                    "synth_svg": synth_svg,
+                    "synth_netlist": synth_netlist,
                     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 })
                 st.toast(f"Added '{module_name}' to the Verified Gallery →", icon="🖼️")
@@ -588,3 +720,17 @@ with tab_gallery:
                         st.download_button("📥 Download .vcd", data=entry["vcd_bytes"],
                                             file_name=f"{entry['module_name']}.vcd", mime="text/plain",
                                             key=f"gallery_vcd_dl_{i}")
+
+                if entry.get("synth_svg"):
+                    with st.expander("View gate-level schematic (Yosys synthesis)"):
+                        stats = entry.get("synth_stats")
+                        if stats and stats.get("cells_total") is not None:
+                            st.caption(f"{stats['cells_total']} gate-level cells · {stats.get('wires', '—')} wires")
+                        st.components.v1.html(render_svg_html(entry["synth_svg"], max_height=500), height=520, scrolling=True)
+                        st.download_button("📥 Download schematic (.svg)", data=entry["synth_svg"],
+                                            file_name=f"{entry['module_name']}_schematic.svg", mime="image/svg+xml",
+                                            key=f"gallery_svg_dl_{i}")
+                        if entry.get("synth_netlist"):
+                            st.download_button("📥 Download netlist (.v)", data=entry["synth_netlist"],
+                                                file_name=f"{entry['module_name']}_netlist.v", mime="text/plain",
+                                                key=f"gallery_netlist_dl_{i}")
